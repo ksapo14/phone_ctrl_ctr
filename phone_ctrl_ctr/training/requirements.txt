@@ -1,0 +1,4 @@
+# Install your cluster's CUDA-enabled PyTorch >=2.6,<3 separately.
+transformers==4.57.3
+accelerate==1.12.0
+safetensors>=0.4.3,<1

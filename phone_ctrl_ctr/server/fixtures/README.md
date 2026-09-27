@@ -1,0 +1,1 @@
+The audio-test certificate/key are disposable loopback HTTPS test fixtures. They are not trusted system-wide, are never used by launchers, and must not be used for the actual companion. Tests trust this certificate only within their own Node requests.

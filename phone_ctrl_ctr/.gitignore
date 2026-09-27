@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+server/apps.local.json
+__pycache__/
+.venv/
+training/output/
+training/runs/
+training/*evaluation*.json
+certs/
