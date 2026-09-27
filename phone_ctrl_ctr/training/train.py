@@ -1,18 +1,18 @@
 import os
-import re
 import json
-import argparse
 from pathlib import Path
 
 import torch
+import transformers
+import datasets
+import trl
 
-from datasets import Dataset
+from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     set_seed,
 )
-
 from trl import (
     SFTTrainer,
     SFTConfig,
@@ -20,229 +20,130 @@ from trl import (
 
 
 # ============================================================
-# DEFAULT CONFIG
+# CONFIG
 # ============================================================
 
 MODEL_ID = "google/functiongemma-270m-it"
 
-DEFAULT_TRAIN_FILE = "desktop_commands_train.jsonl"
-DEFAULT_EVAL_FILE = "desktop_commands_eval.jsonl"
+TRAIN_FILE = "desktop_commands_train.jsonl"
+EVAL_FILE = "desktop_commands_eval.jsonl"
 
-DEFAULT_OUTPUT_DIR = "./functiongemma-desktop-checkpoints"
-DEFAULT_FINAL_DIR = "./functiongemma-desktop-model"
+CHECKPOINT_DIR = "./functiongemma-desktop-checkpoints"
+FINAL_MODEL_DIR = "./functiongemma-desktop-model"
 
 SEED = 42
 
+# Good starting values for your H200 + ~thousands of examples.
+NUM_EPOCHS = 4
 LEARNING_RATE = 5e-5
-
-# Dataset is much larger than Google's tiny demonstration,
-# so start more conservatively than blindly doing 8 epochs.
-DEFAULT_EPOCHS = 4
 
 TRAIN_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 16
 
 GRADIENT_ACCUMULATION_STEPS = 1
 
-# 7 tool schemas take significant context.
 MAX_LENGTH = 1024
 
-MAX_NEW_TOKENS = 128
-
 
 # ============================================================
-# ARGUMENTS
-# ============================================================
-
-parser = argparse.ArgumentParser()
-
-parser.add_argument(
-    "--train-file",
-    default=DEFAULT_TRAIN_FILE,
-)
-
-parser.add_argument(
-    "--eval-file",
-    default=DEFAULT_EVAL_FILE,
-)
-
-parser.add_argument(
-    "--output-dir",
-    default=DEFAULT_OUTPUT_DIR,
-)
-
-parser.add_argument(
-    "--final-dir",
-    default=DEFAULT_FINAL_DIR,
-)
-
-parser.add_argument(
-    "--epochs",
-    type=int,
-    default=DEFAULT_EPOCHS,
-)
-
-parser.add_argument(
-    "--resume",
-    default=None,
-    help=(
-        "Optional Trainer checkpoint directory "
-        "to resume from."
-    ),
-)
-
-args = parser.parse_args()
-
-
-TRAIN_FILE = args.train_file
-EVAL_FILE = args.eval_file
-
-OUTPUT_DIR = args.output_dir
-FINAL_MODEL_DIR = args.final_dir
-
-NUM_EPOCHS = args.epochs
-
-
-# ============================================================
-# SEED
+# REPRODUCIBILITY
 # ============================================================
 
 set_seed(SEED)
 
 
 # ============================================================
-# HELPERS
-# ============================================================
-
-def load_jsonl(path):
-
-    rows = []
-
-    with open(
-        path,
-        "r",
-        encoding="utf-8",
-    ) as f:
-
-        for line_number, line in enumerate(
-            f,
-            start=1,
-        ):
-
-            if not line.strip():
-                continue
-
-            try:
-                rows.append(
-                    json.loads(line)
-                )
-
-            except json.JSONDecodeError as e:
-
-                raise ValueError(
-                    f"Invalid JSON in "
-                    f"{path}:{line_number}"
-                ) from e
-
-    return rows
-
-
-def canonical_json(value):
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-# ============================================================
-# FILE CHECKS
-# ============================================================
-
-for path in [
-    TRAIN_FILE,
-    EVAL_FILE,
-]:
-
-    if not Path(path).exists():
-
-        raise FileNotFoundError(
-            f"{path} does not exist.\n"
-            "Run make_dataset.py first."
-        )
-
-
-# ============================================================
-# LOAD RAW DATA
+# BANNER
 # ============================================================
 
 print("=" * 72)
 print("FUNCTIONGEMMA DESKTOP ROUTER TRAINING")
 print("=" * 72)
 
+print("\nLibrary versions:")
+print("  PyTorch:     ", torch.__version__)
+print("  Transformers:", transformers.__version__)
+print("  Datasets:    ", datasets.__version__)
+print("  TRL:         ", trl.__version__)
+
+
+# ============================================================
+# CHECK DATASET FILES
+# ============================================================
+
+for path in [TRAIN_FILE, EVAL_FILE]:
+
+    if not Path(path).exists():
+
+        raise FileNotFoundError(
+            f"\nMissing dataset file:\n"
+            f"  {path}\n\n"
+            f"Run:\n"
+            f"  python make_dataset.py\n"
+        )
+
+    if Path(path).stat().st_size == 0:
+
+        raise RuntimeError(
+            f"\nDataset file is empty:\n"
+            f"  {path}\n\n"
+            f"Run make_dataset.py again before training.\n"
+        )
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
 print("\nLoading datasets...")
 
-raw_train = load_jsonl(TRAIN_FILE)
-raw_eval = load_jsonl(EVAL_FILE)
+dataset = load_dataset(
+    "json",
+    data_files={
+        "train": TRAIN_FILE,
+        "validation": EVAL_FILE,
+    },
+)
+
+train_dataset = dataset["train"]
+eval_dataset = dataset["validation"]
 
 print(
-    f"Training examples: {len(raw_train)}"
+    f"Training examples:   {len(train_dataset)}"
 )
 
 print(
-    f"Evaluation examples: {len(raw_eval)}"
+    f"Evaluation examples: {len(eval_dataset)}"
 )
 
 
-# ============================================================
-# VERIFY TOOL SCHEMAS ARE IDENTICAL
-#
-# You do NOT want some examples silently giving the model a
-# different API surface.
-# ============================================================
+if len(train_dataset) == 0:
 
-if len(raw_train) == 0:
-    raise ValueError(
+    raise RuntimeError(
         "Training dataset is empty."
     )
 
-EXPECTED_TOOLS = raw_train[0]["tools"]
 
-expected_tools_json = canonical_json(
-    EXPECTED_TOOLS
-)
+if len(eval_dataset) == 0:
 
-
-def verify_tool_schemas(rows, name):
-
-    for i, row in enumerate(rows):
-
-        if canonical_json(
-            row["tools"]
-        ) != expected_tools_json:
-
-            raise ValueError(
-                f"{name}[{i}] has different "
-                f"tool definitions."
-            )
-
-
-verify_tool_schemas(
-    raw_train,
-    "train",
-)
-
-verify_tool_schemas(
-    raw_eval,
-    "eval",
-)
-
-print("Tool schemas: consistent")
+    raise RuntimeError(
+        "Evaluation dataset is empty."
+    )
 
 
 # ============================================================
-# RUNTIME CALL VALIDATION
+# BASIC DATASET VALIDATION
 # ============================================================
+
+ALLOWED_FUNCTIONS = {
+    "start_app",
+    "set_volume",
+    "set_brightness",
+    "pause_media",
+    "play_media",
+    "skip_media",
+    "open_website",
+}
 
 ALLOWED_APPS = {
     "chrome",
@@ -262,50 +163,46 @@ ALLOWED_SITES = {
     "youtube",
 }
 
-ALLOWED_FUNCTIONS = {
-    "start_app",
-    "set_volume",
-    "set_brightness",
-    "pause_media",
-    "play_media",
-    "skip_media",
-    "open_website",
-}
 
+def validate_call(call_data):
 
-def validate_function_call(
-    name,
-    arguments,
-):
+    if "function" not in call_data:
+        raise ValueError(
+            f"Malformed tool call: {call_data}"
+        )
+
+    function = call_data["function"]
+
+    name = function.get("name")
+    arguments = function.get(
+        "arguments",
+        {},
+    )
 
     if name not in ALLOWED_FUNCTIONS:
 
-        return (
-            False,
-            f"Unknown function: {name}",
+        raise ValueError(
+            f"Unsupported function: {name}"
         )
 
     if not isinstance(arguments, dict):
 
-        return (
-            False,
-            "Arguments must be an object",
+        raise ValueError(
+            f"Arguments must be dict: {arguments}"
         )
 
     if name == "start_app":
 
         if set(arguments.keys()) != {"app"}:
 
-            return (
-                False,
-                "start_app requires only app",
+            raise ValueError(
+                f"Invalid start_app args: {arguments}"
             )
 
         if arguments["app"] not in ALLOWED_APPS:
 
-            return (
-                False,
-                "Unsupported app",
+            raise ValueError(
+                f"Unsupported app: {arguments['app']}"
             )
 
     elif name in {
@@ -315,69 +212,79 @@ def validate_function_call(
 
         if set(arguments.keys()) != {"level"}:
 
-            return (
-                False,
-                f"{name} requires only level",
+            raise ValueError(
+                f"Invalid {name} args: {arguments}"
             )
 
         level = arguments["level"]
 
         if type(level) is not int:
 
-            return (
-                False,
-                "level must be an integer",
+            raise ValueError(
+                f"{name} level must be int: {level}"
             )
 
         if not 0 <= level <= 100:
 
-            return (
-                False,
-                "level must be between 0 and 100",
+            raise ValueError(
+                f"{name} level out of range: {level}"
             )
 
     elif name == "open_website":
 
         if set(arguments.keys()) != {"site"}:
 
-            return (
-                False,
-                "open_website requires only site",
+            raise ValueError(
+                f"Invalid open_website args: {arguments}"
             )
 
         if arguments["site"] not in ALLOWED_SITES:
 
-            return (
-                False,
-                "Unsupported website",
+            raise ValueError(
+                f"Unsupported site: {arguments['site']}"
             )
 
     else:
 
+        # pause/play/skip take zero arguments.
         if arguments:
 
-            return (
-                False,
-                f"{name} does not accept arguments",
+            raise ValueError(
+                f"{name} should have no args: {arguments}"
             )
 
-    return True, None
 
+def validate_dataset(split, split_name):
 
-def validate_dataset_calls(
-    rows,
-    name,
-):
+    for index, row in enumerate(split):
 
-    for row_index, row in enumerate(rows):
+        if "messages" not in row:
 
-        assistant = row["messages"][-1]
+            raise ValueError(
+                f"{split_name}[{index}] has no messages"
+            )
+
+        if "tools" not in row:
+
+            raise ValueError(
+                f"{split_name}[{index}] has no tools"
+            )
+
+        messages = row["messages"]
+
+        if len(messages) < 3:
+
+            raise ValueError(
+                f"{split_name}[{index}] has too few messages"
+            )
+
+        assistant = messages[-1]
 
         if assistant["role"] != "assistant":
 
             raise ValueError(
-                f"{name}[{row_index}] "
-                "doesn't end with assistant"
+                f"{split_name}[{index}] does not end "
+                f"with an assistant response"
             )
 
         calls = assistant.get(
@@ -388,48 +295,73 @@ def validate_dataset_calls(
         if not calls:
 
             raise ValueError(
-                f"{name}[{row_index}] "
-                "contains no tool calls"
+                f"{split_name}[{index}] contains "
+                f"no tool calls"
             )
 
-        for call in calls:
+        for call_data in calls:
 
-            function = call["function"]
-
-            valid, error = validate_function_call(
-                function["name"],
-                function.get(
-                    "arguments",
-                    {},
-                ),
-            )
-
-            if not valid:
-
-                raise ValueError(
-                    f"{name}[{row_index}] "
-                    f"has invalid call: {error}"
-                )
+            validate_call(call_data)
 
 
-validate_dataset_calls(
-    raw_train,
+print("\nValidating datasets...")
+
+validate_dataset(
+    train_dataset,
     "train",
 )
 
-validate_dataset_calls(
-    raw_eval,
-    "eval",
+validate_dataset(
+    eval_dataset,
+    "validation",
 )
 
-print("Dataset calls: valid")
+print("Dataset validation: PASSED")
 
 
 # ============================================================
-# HARD TRAIN / EVAL LEAKAGE CHECK
+# VERIFY TOOL DEFINITIONS MATCH ACROSS ALL EXAMPLES
 # ============================================================
 
-def normalized_prompt(row):
+def canonical_json(value):
+
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+expected_tools = canonical_json(
+    train_dataset[0]["tools"]
+)
+
+
+for split_name, split in [
+    ("train", train_dataset),
+    ("validation", eval_dataset),
+]:
+
+    for index, row in enumerate(split):
+
+        if canonical_json(
+            row["tools"]
+        ) != expected_tools:
+
+            raise RuntimeError(
+                f"{split_name}[{index}] has a "
+                f"different tool schema."
+            )
+
+
+print("Tool schemas: consistent")
+
+
+# ============================================================
+# HARD TRAIN/EVAL LEAKAGE CHECK
+# ============================================================
+
+def get_user_text(row):
 
     for message in row["messages"]:
 
@@ -443,62 +375,84 @@ def normalized_prompt(row):
             )
 
     raise ValueError(
-        "Example contains no user message"
+        "Example has no user message."
     )
 
 
 train_prompts = {
-    normalized_prompt(row)
-    for row in raw_train
+    get_user_text(row)
+    for row in train_dataset
 }
 
 eval_prompts = {
-    normalized_prompt(row)
-    for row in raw_eval
+    get_user_text(row)
+    for row in eval_dataset
 }
 
-overlap = train_prompts & eval_prompts
+overlap = (
+    train_prompts
+    & eval_prompts
+)
+
 
 if overlap:
 
-    raise ValueError(
-        "Train/eval leakage detected:\n"
-        + "\n".join(sorted(overlap))
+    raise RuntimeError(
+        "Train/eval leakage found:\n"
+        + "\n".join(
+            sorted(overlap)
+        )
     )
 
-print("Train/eval leakage: none")
+
+print("Train/eval exact leakage: none")
 
 
 # ============================================================
-# DEVICE / PRECISION
+# CHECK GPU
 # ============================================================
 
 print("\nHardware:")
 
-if torch.cuda.is_available():
+if not torch.cuda.is_available():
 
-    print(
-        "  GPU:",
-        torch.cuda.get_device_name(0),
+    raise RuntimeError(
+        "\nCUDA is NOT available.\n"
+        "Do not train until you are inside the GPU allocation."
     )
 
-    BF16 = torch.cuda.is_bf16_supported()
 
-    if BF16:
-        MODEL_DTYPE = torch.bfloat16
-        print("  Precision: BF16")
+gpu_name = torch.cuda.get_device_name(0)
 
-    else:
-        MODEL_DTYPE = torch.float16
-        print("  Precision: FP16")
+gpu_memory_gb = (
+    torch.cuda.get_device_properties(0)
+    .total_memory
+    / 1024**3
+)
 
-else:
+bf16_supported = (
+    torch.cuda.is_bf16_supported()
+)
 
-    MODEL_DTYPE = torch.float32
-    BF16 = True
 
-    print("  GPU: none")
-    print("  Precision: FP32")
+print(
+    f"  GPU:  {gpu_name}"
+)
+
+print(
+    f"  VRAM: {gpu_memory_gb:.2f} GB"
+)
+
+print(
+    f"  BF16: {bf16_supported}"
+)
+
+
+if not bf16_supported:
+
+    print(
+        "\nWARNING: BF16 is not reported as supported."
+    )
 
 
 # ============================================================
@@ -511,382 +465,107 @@ tokenizer = AutoTokenizer.from_pretrained(
     MODEL_ID,
 )
 
-if tokenizer.pad_token_id is None:
+
+# FunctionGemma should already have the correct tokenizer
+# configuration, but provide a safe padding fallback.
+if tokenizer.pad_token is None:
 
     tokenizer.pad_token = tokenizer.eos_token
-
-tokenizer.padding_side = "right"
 
 
 # ============================================================
 # LOAD MODEL
-#
-# Do NOT use device_map="auto" here.
-# Trainer/Accelerate should manage placement during training.
 # ============================================================
 
-print("Loading model...")
+print("Loading FunctionGemma...")
+
+dtype = (
+    torch.bfloat16
+    if bf16_supported
+    else torch.float16
+)
+
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    dtype=MODEL_DTYPE,
+
+    dtype=dtype,
+
+    # Google's FunctionGemma fine-tuning example
+    # uses eager attention.
     attn_implementation="eager",
 )
 
+
+# Trainer will place the model on the H200.
+#
+# Don't use device_map="auto" here because we're training on
+# one GPU and letting Trainer/Accelerate manage placement.
 model.config.use_cache = False
 
 
+print(
+    f"Model dtype: {model.dtype}"
+)
+
+
 # ============================================================
-# VERIFY CHAT TEMPLATE VISUALLY
+# VERIFY FUNCTIONGEMMA CHAT TEMPLATE
 # ============================================================
 
-print("\nExample formatted training conversation:\n")
+print("\n" + "=" * 72)
+print("FORMATTED TRAINING EXAMPLE")
+print("=" * 72)
 
-example_text = tokenizer.apply_chat_template(
-    raw_train[0]["messages"],
-    tools=raw_train[0]["tools"],
+first_example = train_dataset[0]
+
+formatted = tokenizer.apply_chat_template(
+    first_example["messages"],
+    tools=first_example["tools"],
     add_generation_prompt=False,
     tokenize=False,
 )
 
-print(example_text[:5000])
-
-
-# ============================================================
-# COMPLETION-ONLY TOKENIZATION
-#
-# This is one of the biggest improvements over the old script.
-#
-# We create:
-#
-# PROMPT:
-#   developer + tools + user + model-start token
-#
-# FULL:
-#   developer + tools + user + model function call
-#
-# labels:
-#   -100 for every prompt token
-#   real token IDs ONLY for the function-call completion
-#
-# CrossEntropy ignores -100.
-# ============================================================
-
-def common_prefix_length(a, b):
-
-    length = min(
-        len(a),
-        len(b),
-    )
-
-    i = 0
-
-    while (
-        i < length
-        and a[i] == b[i]
-    ):
-        i += 1
-
-    return i
-
-
-def tokenize_training_example(row):
-
-    messages = row["messages"]
-    tools = row["tools"]
-
-    if (
-        messages[-1]["role"]
-        != "assistant"
-    ):
-
-        raise ValueError(
-            "Final message must be assistant."
-        )
-
-    prompt_messages = messages[:-1]
-
-    # Prompt ending directly before the assistant's output.
-    prompt_ids = tokenizer.apply_chat_template(
-        prompt_messages,
-        tools=tools,
-        add_generation_prompt=True,
-        tokenize=True,
-    )
-
-    # Complete training conversation.
-    full_ids = tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
-        add_generation_prompt=False,
-        tokenize=True,
-    )
-
-    prefix_len = common_prefix_length(
-        prompt_ids,
-        full_ids,
-    )
-
-    # Normally these should be either identical
-    # through the entire prompt or extremely close.
-    prefix_ratio = (
-        prefix_len
-        / max(1, len(prompt_ids))
-    )
-
-    if prefix_ratio < 0.95:
-
-        raise RuntimeError(
-            "\nFunctionGemma prompt/full template "
-            "mismatch detected.\n"
-            f"Prompt tokens: {len(prompt_ids)}\n"
-            f"Common prefix: {prefix_len}\n"
-            f"Ratio: {prefix_ratio:.3f}\n"
-            "\nRefusing to train because this could "
-            "produce the wrong loss mask."
-        )
-
-    if len(full_ids) > MAX_LENGTH:
-
-        raise RuntimeError(
-            "\nExample exceeds MAX_LENGTH.\n"
-            f"Length: {len(full_ids)}\n"
-            f"MAX_LENGTH: {MAX_LENGTH}\n"
-            "\nIncrease MAX_LENGTH rather than "
-            "silently truncating function calls."
-        )
-
-    labels = (
-        [-100] * prefix_len
-        + full_ids[prefix_len:]
-    )
-
-    if len(labels) != len(full_ids):
-
-        raise RuntimeError(
-            "Label/input length mismatch."
-        )
-
-    target_tokens = sum(
-        label != -100
-        for label in labels
-    )
-
-    if target_tokens == 0:
-
-        raise RuntimeError(
-            "Training example has no target tokens."
-        )
-
-    return {
-        "input_ids": full_ids,
-
-        "attention_mask": [
-            1
-        ] * len(full_ids),
-
-        "labels": labels,
-    }
-
-
-# ============================================================
-# TOKENIZE ENTIRE DATASET
-# ============================================================
-
-print("\nTokenizing and masking datasets...")
-
-tokenized_train = [
-    tokenize_training_example(row)
-    for row in raw_train
-]
-
-tokenized_eval = [
-    tokenize_training_example(row)
-    for row in raw_eval
-]
-
-
-train_lengths = [
-    len(x["input_ids"])
-    for x in tokenized_train
-]
-
-eval_lengths = [
-    len(x["input_ids"])
-    for x in tokenized_eval
-]
-
-
 print(
-    f"Longest training sequence: "
-    f"{max(train_lengths)} tokens"
+    formatted[:6000]
 )
 
-print(
-    f"Longest evaluation sequence: "
-    f"{max(eval_lengths)} tokens"
-)
-
-
-train_dataset = Dataset.from_list(
-    tokenized_train
-)
-
-eval_dataset = Dataset.from_list(
-    tokenized_eval
-)
+print("\n" + "=" * 72)
 
 
 # ============================================================
-# VERIFY THAT MASKING WORKED
-# ============================================================
-
-sample = tokenized_train[0]
-
-target_ids = [
-    token_id
-    for token_id, label
-    in zip(
-        sample["input_ids"],
-        sample["labels"],
-    )
-    if label != -100
-]
-
-print("\nMODEL IS BEING TRAINED ON THIS TARGET:\n")
-
-print(
-    tokenizer.decode(
-        target_ids,
-        skip_special_tokens=False,
-    )
-)
-
-
-# ============================================================
-# CUSTOM COLLATOR
+# SFT CONFIG
 #
-# Pads:
+# IMPORTANT:
 #
-# input_ids -> tokenizer pad ID
-# masks     -> 0
-# labels    -> -100
+# We intentionally DO NOT manually tokenize/mask the dataset.
 #
-# This ensures padded labels do not contribute to loss.
+# TRL receives the raw conversational dataset containing:
+#
+#     messages
+#     tools
+#
+# and applies FunctionGemma's chat template itself.
 # ============================================================
-
-class FunctionCallCollator:
-
-    def __init__(
-        self,
-        tokenizer,
-        pad_to_multiple_of=8,
-    ):
-
-        self.tokenizer = tokenizer
-
-        self.pad_to_multiple_of = (
-            pad_to_multiple_of
-        )
-
-    def __call__(self, features):
-
-        max_len = max(
-            len(x["input_ids"])
-            for x in features
-        )
-
-        if self.pad_to_multiple_of:
-
-            multiple = (
-                self.pad_to_multiple_of
-            )
-
-            max_len = (
-                (
-                    max_len
-                    + multiple
-                    - 1
-                )
-                // multiple
-            ) * multiple
-
-        batch_input_ids = []
-        batch_attention = []
-        batch_labels = []
-
-        for feature in features:
-
-            length = len(
-                feature["input_ids"]
-            )
-
-            padding = (
-                max_len - length
-            )
-
-            batch_input_ids.append(
-                feature["input_ids"]
-                + [
-                    self.tokenizer.pad_token_id
-                ] * padding
-            )
-
-            batch_attention.append(
-                feature["attention_mask"]
-                + [0] * padding
-            )
-
-            batch_labels.append(
-                feature["labels"]
-                + [-100] * padding
-            )
-
-        return {
-            "input_ids": torch.tensor(
-                batch_input_ids,
-                dtype=torch.long,
-            ),
-
-            "attention_mask": torch.tensor(
-                batch_attention,
-                dtype=torch.long,
-            ),
-
-            "labels": torch.tensor(
-                batch_labels,
-                dtype=torch.long,
-            ),
-        }
-
-
-collator = FunctionCallCollator(
-    tokenizer
-)
-
-
-# ============================================================
-# TRAINING CONFIG
-# ============================================================
-
-optimizer = (
-    "adamw_torch_fused"
-    if torch.cuda.is_available()
-    else "adamw_torch"
-)
-
 
 training_args = SFTConfig(
 
-    output_dir=OUTPUT_DIR,
+    # --------------------------------------------------------
+    # OUTPUT
+    # --------------------------------------------------------
+
+    output_dir=CHECKPOINT_DIR,
 
     overwrite_output_dir=True,
 
-    # ----------------------------------------
-    # Epochs / batch
-    # ----------------------------------------
+
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
 
     num_train_epochs=NUM_EPOCHS,
+
+    learning_rate=LEARNING_RATE,
 
     per_device_train_batch_size=(
         TRAIN_BATCH_SIZE
@@ -900,59 +579,52 @@ training_args = SFTConfig(
         GRADIENT_ACCUMULATION_STEPS
     ),
 
-    # ----------------------------------------
-    # Learning rate
-    # ----------------------------------------
 
-    learning_rate=LEARNING_RATE,
-
-    lr_scheduler_type="constant",
-
-    weight_decay=0.01,
-
-    # ----------------------------------------
-    # Precision
-    # ----------------------------------------
-
-    bf16=BF16,
-
-    fp16=(
-        torch.cuda.is_available()
-        and not BF16
-    ),
-
-    # ----------------------------------------
-    # Data
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # SEQUENCE LENGTH
+    # --------------------------------------------------------
 
     max_length=MAX_LENGTH,
 
     packing=False,
 
-    # Already manually masked/tokenized.
-    completion_only_loss=False,
 
-    assistant_only_loss=False,
+    # --------------------------------------------------------
+    # OPTIMIZATION
+    # --------------------------------------------------------
 
-    # ----------------------------------------
-    # Optimization
-    # ----------------------------------------
+    optim="adamw_torch_fused",
 
-    optim=optimizer,
+    weight_decay=0.01,
 
-    gradient_checkpointing=False,
+    lr_scheduler_type="constant",
 
     max_grad_norm=1.0,
 
-    # ----------------------------------------
-    # Evaluation
-    # ----------------------------------------
+
+    # --------------------------------------------------------
+    # H200 PRECISION
+    # --------------------------------------------------------
+
+    bf16=bf16_supported,
+
+    fp16=(
+        not bf16_supported
+    ),
+
+    gradient_checkpointing=False,
+
+
+    # --------------------------------------------------------
+    # EVALUATION
+    # --------------------------------------------------------
 
     eval_strategy="epoch",
 
-    # ----------------------------------------
-    # Saving
-    # ----------------------------------------
+
+    # --------------------------------------------------------
+    # CHECKPOINT SAVING
+    # --------------------------------------------------------
 
     save_strategy="epoch",
 
@@ -964,9 +636,10 @@ training_args = SFTConfig(
 
     greater_is_better=False,
 
-    # ----------------------------------------
-    # Logging
-    # ----------------------------------------
+
+    # --------------------------------------------------------
+    # LOGGING
+    # --------------------------------------------------------
 
     logging_strategy="steps",
 
@@ -976,24 +649,32 @@ training_args = SFTConfig(
 
     report_to="tensorboard",
 
-    # ----------------------------------------
-    # Reproducibility
-    # ----------------------------------------
+
+    # --------------------------------------------------------
+    # REPRODUCIBILITY
+    # --------------------------------------------------------
 
     seed=SEED,
 
     data_seed=SEED,
 
-    # Dataset is already prepared.
-    remove_unused_columns=False,
+
+    # --------------------------------------------------------
+    # DATASET
+    # --------------------------------------------------------
+
+    remove_unused_columns=True,
 )
 
 
 # ============================================================
-# TRAINER
+# CREATE TRAINER
 # ============================================================
 
+print("\nCreating SFTTrainer...")
+
 trainer = SFTTrainer(
+
     model=model,
 
     args=training_args,
@@ -1003,8 +684,6 @@ trainer = SFTTrainer(
     eval_dataset=eval_dataset,
 
     processing_class=tokenizer,
-
-    data_collator=collator,
 )
 
 
@@ -1013,46 +692,49 @@ trainer = SFTTrainer(
 # ============================================================
 
 print("\n" + "=" * 72)
-print("STARTING FULL FINE-TUNE")
+print("STARTING FULL FUNCTIONGEMMA FINE-TUNE")
 print("=" * 72)
 
+train_result = trainer.train()
 
-train_result = trainer.train(
-    resume_from_checkpoint=args.resume
-)
 
+# ============================================================
+# TRAINING FINISHED
+# ============================================================
 
 print("\n" + "=" * 72)
 print("TRAINING COMPLETE")
 print("=" * 72)
 
+print("\nTraining metrics:")
 
-for key, value in (
-    train_result.metrics.items()
-):
+for key, value in train_result.metrics.items():
+
     print(
-        f"{key}: {value}"
+        f"  {key}: {value}"
     )
 
 
 # ============================================================
-# FINAL LOSS EVALUATION
+# EVALUATE BEST CHECKPOINT
 # ============================================================
 
 print("\nEvaluating best checkpoint...")
 
-eval_loss_metrics = trainer.evaluate()
+eval_metrics = trainer.evaluate()
 
-for key, value in (
-    eval_loss_metrics.items()
-):
+
+print("\nEvaluation metrics:")
+
+for key, value in eval_metrics.items():
+
     print(
-        f"{key}: {value}"
+        f"  {key}: {value}"
     )
 
 
 # ============================================================
-# SAVE ACTUAL FINE-TUNED PARAMETERS
+# SAVE FINAL FULL MODEL
 # ============================================================
 
 print("\nSaving final model...")
@@ -1062,7 +744,10 @@ os.makedirs(
     exist_ok=True,
 )
 
+
+# Re-enable KV cache for inference.
 trainer.model.config.use_cache = True
+
 
 trainer.save_model(
     FINAL_MODEL_DIR
@@ -1074,516 +759,252 @@ tokenizer.save_pretrained(
 
 
 # ============================================================
-# FUNCTIONGEMMA OUTPUT PARSER
-#
-# Example:
-#
-# <start_function_call>
-# call:set_volume{level:42}
-# <end_function_call>
+# SAVE METRICS
 # ============================================================
 
-CALL_PATTERN = re.compile(
-    r"<start_function_call>"
-    r"call:(\w+)"
-    r"\{(.*?)\}"
-    r"<end_function_call>",
-    re.DOTALL,
-)
-
-ARG_PATTERN = re.compile(
-    r"(\w+):"
-    r"(?:"
-    r"<escape>(.*?)<escape>"
-    r"|"
-    r"([^,}]*)"
-    r")"
-)
-
-
-def cast_argument(value):
-
-    value = value.strip()
-
-    if (
-        len(value) >= 2
-        and value[0] == value[-1]
-        and value[0] in {"'", '"'}
-    ):
-        value = value[1:-1]
-
-    if value.lower() == "true":
-        return True
-
-    if value.lower() == "false":
-        return False
-
-    try:
-        return int(value)
-
-    except ValueError:
-        pass
-
-    try:
-        return float(value)
-
-    except ValueError:
-        pass
-
-    return value
-
-
-def parse_tool_calls(text):
-
-    calls = []
-
-    for (
-        function_name,
-        raw_arguments,
-    ) in CALL_PATTERN.findall(text):
-
-        arguments = {}
-
-        for (
-            key,
-            escaped_value,
-            plain_value,
-        ) in ARG_PATTERN.findall(
-            raw_arguments
-        ):
-
-            raw_value = (
-                escaped_value
-                if escaped_value != ""
-                else plain_value
-            )
-
-            arguments[key] = cast_argument(
-                raw_value
-            )
-
-        calls.append({
-            "name": function_name,
-            "arguments": arguments,
-        })
-
-    return calls
-
-
-# ============================================================
-# EXPECTED CALL NORMALIZATION
-# ============================================================
-
-def expected_calls(row):
-
-    assistant = row["messages"][-1]
-
-    output = []
-
-    for call_data in assistant[
-        "tool_calls"
-    ]:
-
-        function = call_data[
-            "function"
-        ]
-
-        output.append({
-            "name": function["name"],
-            "arguments": function.get(
-                "arguments",
-                {},
-            ),
-        })
-
-    return output
-
-
-# ============================================================
-# GENERATE ONE ROUTING RESPONSE
-# ============================================================
-
-def generate_calls(row):
-
-    messages = row["messages"][:-1]
-
-    tools = row["tools"]
-
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
-
-    inputs = {
-        key: value.to(
-            trainer.model.device
-        )
-        for key, value in inputs.items()
-    }
-
-    with torch.inference_mode():
-
-        output = trainer.model.generate(
-            **inputs,
-
-            max_new_tokens=(
-                MAX_NEW_TOKENS
-            ),
-
-            do_sample=False,
-
-            pad_token_id=(
-                tokenizer.eos_token_id
-            ),
-        )
-
-    generated_tokens = output[0][
-        inputs["input_ids"].shape[1]:
-    ]
-
-    raw_output = tokenizer.decode(
-        generated_tokens,
-        skip_special_tokens=False,
-    )
-
-    return (
-        raw_output,
-        parse_tool_calls(raw_output),
-    )
-
-
-# ============================================================
-# ROUTING BENCHMARK
-# ============================================================
-
-print("\n" + "=" * 72)
-print("HELD-OUT FUNCTION CALL BENCHMARK")
-print("=" * 72)
-
-trainer.model.eval()
-
-
-total = len(raw_eval)
-
-exact_correct = 0
-tool_sequence_correct = 0
-valid_output_count = 0
-
-predictions = []
-
-
-for index, row in enumerate(
-    raw_eval,
-    start=1,
-):
-
-    expected = expected_calls(row)
-
-    raw_output, predicted = (
-        generate_calls(row)
-    )
-
-    exact = (
-        predicted == expected
-    )
-
-    expected_names = [
-        x["name"]
-        for x in expected
-    ]
-
-    predicted_names = [
-        x["name"]
-        for x in predicted
-    ]
-
-    tool_sequence_match = (
-        expected_names
-        == predicted_names
-    )
-
-    all_valid = True
-
-    validation_errors = []
-
-    if not predicted:
-
-        all_valid = False
-
-        validation_errors.append(
-            "No function call parsed"
-        )
-
-    else:
-
-        for predicted_call in predicted:
-
-            valid, error = (
-                validate_function_call(
-                    predicted_call["name"],
-                    predicted_call[
-                        "arguments"
-                    ],
-                )
-            )
-
-            if not valid:
-
-                all_valid = False
-
-                validation_errors.append(
-                    error
-                )
-
-    exact_correct += int(exact)
-
-    tool_sequence_correct += int(
-        tool_sequence_match
-    )
-
-    valid_output_count += int(
-        all_valid
-    )
-
-    user_text = next(
-        message["content"]
-        for message in row["messages"]
-        if message["role"] == "user"
-    )
-
-    result = {
-        "index": index,
-        "user": user_text,
-        "expected": expected,
-        "predicted": predicted,
-        "exact": exact,
-        "tool_sequence_match": (
-            tool_sequence_match
-        ),
-        "valid_output": all_valid,
-        "validation_errors": (
-            validation_errors
-        ),
-        "raw_output": raw_output,
-        "metadata": row.get(
-            "metadata",
-            {},
-        ),
-    }
-
-    predictions.append(result)
-
-    symbol = (
-        "✅"
-        if exact
-        else "❌"
-    )
-
-    print(
-        f"\n{symbol} {index}/{total}"
-    )
-
-    print(
-        f"USER: {user_text}"
-    )
-
-    print(
-        f"EXPECTED: {expected}"
-    )
-
-    print(
-        f"PREDICTED: {predicted}"
-    )
-
-    if not exact:
-
-        print(
-            f"RAW: {raw_output}"
-        )
-
-
-# ============================================================
-# BENCHMARK METRICS
-# ============================================================
-
-exact_accuracy = (
-    exact_correct / total
-    if total
-    else 0
-)
-
-tool_accuracy = (
-    tool_sequence_correct / total
-    if total
-    else 0
-)
-
-valid_rate = (
-    valid_output_count / total
-    if total
-    else 0
-)
-
-
-routing_metrics = {
-    "examples": total,
-
-    "exact_function_call_accuracy": (
-        exact_accuracy
+metrics = {
+    "model": MODEL_ID,
+
+    "training_examples": len(
+        train_dataset
     ),
 
-    "tool_sequence_accuracy": (
-        tool_accuracy
+    "evaluation_examples": len(
+        eval_dataset
     ),
 
-    "valid_output_rate": (
-        valid_rate
+    "epochs": NUM_EPOCHS,
+
+    "learning_rate": LEARNING_RATE,
+
+    "train_batch_size": (
+        TRAIN_BATCH_SIZE
     ),
 
-    "exact_correct": (
-        exact_correct
+    "eval_batch_size": (
+        EVAL_BATCH_SIZE
     ),
 
-    "tool_sequence_correct": (
-        tool_sequence_correct
+    "gradient_accumulation_steps": (
+        GRADIENT_ACCUMULATION_STEPS
     ),
 
-    "valid_outputs": (
-        valid_output_count
+    "max_length": MAX_LENGTH,
+
+    "gpu": gpu_name,
+
+    "gpu_vram_gb": (
+        gpu_memory_gb
+    ),
+
+    "train_metrics": (
+        train_result.metrics
+    ),
+
+    "eval_metrics": (
+        eval_metrics
     ),
 }
 
 
-print("\n" + "=" * 72)
-print("ROUTING RESULTS")
-print("=" * 72)
-
-print(
-    f"Exact calls: "
-    f"{exact_correct}/{total} "
-    f"({exact_accuracy:.2%})"
-)
-
-print(
-    f"Correct tool sequence: "
-    f"{tool_sequence_correct}/{total} "
-    f"({tool_accuracy:.2%})"
-)
-
-print(
-    f"Schema-valid output: "
-    f"{valid_output_count}/{total} "
-    f"({valid_rate:.2%})"
-)
-
-
-# ============================================================
-# SAVE METRICS
-# ============================================================
-
-training_metrics_file = os.path.join(
+metrics_file = os.path.join(
     FINAL_MODEL_DIR,
     "training_metrics.json",
 )
 
-routing_metrics_file = os.path.join(
-    FINAL_MODEL_DIR,
-    "routing_metrics.json",
-)
-
-predictions_file = os.path.join(
-    FINAL_MODEL_DIR,
-    "eval_predictions.jsonl",
-)
-
 
 with open(
-    training_metrics_file,
+    metrics_file,
     "w",
     encoding="utf-8",
 ) as f:
 
     json.dump(
-        {
-            "train": train_result.metrics,
-            "evaluation": eval_loss_metrics,
-        },
+        metrics,
         f,
         indent=2,
         default=str,
     )
 
 
+# ============================================================
+# SMOKE TESTS
+#
+# These do NOT execute anything on the computer.
+#
+# They simply test model generation after training.
+# ============================================================
+
+print("\n" + "=" * 72)
+print("POST-TRAINING SMOKE TESTS")
+print("=" * 72)
+
+
+tools = train_dataset[0]["tools"]
+
+developer_message = (
+    "You are a model that can do function calling "
+    "with the following functions"
+)
+
+
+TEST_PROMPTS = [
+    "Open VS Code",
+
+    "Set volume to 47",
+
+    "Brightness 72",
+
+    "Pause the music",
+
+    "Resume playback",
+
+    "Skip this song",
+
+    "Take me to GitHub",
+
+    "Open Google Docs",
+
+    "Don't open GitHub, launch Chrome",
+
+    "Set the speakers to thirty seven percent",
+
+    "Put my display at 83 percent",
+
+    "Open Spotify and set volume to 35",
+
+    "Pause the music and open Google Drive",
+
+    "Volume 22 and brightness 71",
+]
+
+
+smoke_results = []
+
+
+trainer.model.eval()
+
+
+for prompt in TEST_PROMPTS:
+
+    messages = [
+        {
+            "role": "developer",
+            "content": developer_message,
+        },
+        {
+            "role": "user",
+            "content": prompt,
+        },
+    ]
+
+
+    inputs = tokenizer.apply_chat_template(
+        messages,
+
+        tools=tools,
+
+        add_generation_prompt=True,
+
+        tokenize=True,
+
+        return_dict=True,
+
+        return_tensors="pt",
+    )
+
+
+    inputs = {
+        key: value.to(
+            trainer.model.device
+        )
+
+        for key, value
+        in inputs.items()
+    }
+
+
+    with torch.inference_mode():
+
+        generated = trainer.model.generate(
+            **inputs,
+
+            max_new_tokens=128,
+
+            do_sample=False,
+
+            pad_token_id=(
+                tokenizer.pad_token_id
+            ),
+
+            eos_token_id=(
+                tokenizer.eos_token_id
+            ),
+        )
+
+
+    # Only decode newly generated tokens,
+    # not the original prompt.
+    generated_tokens = generated[0][
+        inputs["input_ids"].shape[1]:
+    ]
+
+
+    response = tokenizer.decode(
+        generated_tokens,
+
+        skip_special_tokens=False,
+    )
+
+
+    result = {
+        "prompt": prompt,
+        "output": response,
+    }
+
+
+    smoke_results.append(
+        result
+    )
+
+
+    print("\nUSER:")
+    print(
+        prompt
+    )
+
+    print("MODEL:")
+    print(
+        response
+    )
+
+
+# ============================================================
+# SAVE SMOKE TEST OUTPUTS
+# ============================================================
+
+smoke_file = os.path.join(
+    FINAL_MODEL_DIR,
+    "smoke_test_outputs.json",
+)
+
+
 with open(
-    routing_metrics_file,
+    smoke_file,
     "w",
     encoding="utf-8",
 ) as f:
 
     json.dump(
-        routing_metrics,
+        smoke_results,
         f,
         indent=2,
+        ensure_ascii=False,
     )
 
 
-with open(
-    predictions_file,
-    "w",
-    encoding="utf-8",
-) as f:
-
-    for prediction in predictions:
-
-        f.write(
-            json.dumps(
-                prediction,
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-
-
 # ============================================================
-# CREATE FAILURE FILE
-#
-# Convenient file containing ONLY failures.
-#
-# You can examine these, correct them, and move real-world
-# cases into real_failures.jsonl for the next training run.
-# ============================================================
-
-failure_file = os.path.join(
-    FINAL_MODEL_DIR,
-    "eval_failures.jsonl",
-)
-
-
-with open(
-    failure_file,
-    "w",
-    encoding="utf-8",
-) as f:
-
-    for prediction in predictions:
-
-        if prediction["exact"]:
-            continue
-
-        f.write(
-            json.dumps(
-                prediction,
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-
-
-# ============================================================
-# FINISHED
+# FINAL SUMMARY
 # ============================================================
 
 print("\n" + "=" * 72)
@@ -1592,22 +1013,26 @@ print("=" * 72)
 
 print(
     f"""
-Fine-tuned model:
+Fine-tuned model directory:
+
     {Path(FINAL_MODEL_DIR).resolve()}
 
-Model parameters:
-    {Path(FINAL_MODEL_DIR).resolve()}/model.safetensors
+The important output files are:
 
-Training metrics:
-    {training_metrics_file}
+    {FINAL_MODEL_DIR}/model.safetensors
+    {FINAL_MODEL_DIR}/config.json
+    {FINAL_MODEL_DIR}/tokenizer.json
+    {FINAL_MODEL_DIR}/training_metrics.json
+    {FINAL_MODEL_DIR}/smoke_test_outputs.json
 
-Routing benchmark:
-    {routing_metrics_file}
+Intermediate checkpoints are in:
 
-Every held-out prediction:
-    {predictions_file}
+    {Path(CHECKPOINT_DIR).resolve()}
 
-Only failed evaluation cases:
-    {failure_file}
+To package the model for transfer back to your app:
+
+    tar -czf functiongemma-desktop-model.tar.gz functiongemma-desktop-model
+
+Then download that .tar.gz from the cluster.
 """
 )
