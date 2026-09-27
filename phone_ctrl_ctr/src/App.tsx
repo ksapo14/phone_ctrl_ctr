@@ -5,8 +5,9 @@ import { remote, useRemote } from './remote'
 import type { RemoteWindow } from './remote'
 import Trackpad from './Trackpad'
 import Voice from './Voice'
+import Commands from './Commands'
 
-const modes = ['App', 'Trackpad', 'Window', 'Voice'] as const;
+const modes = ['App', 'Trackpad', 'Window', 'Voice', 'Commands'] as const;
 const apps = [
   { id: 'chrome', name: 'Chrome' }, { id: 'vscode', name: 'VS Code' },
   { id: 'chatgpt', name: 'ChatGPT' }, { id: 'spotify', name: 'Spotify' },
@@ -316,6 +317,7 @@ export default function App() {
         </div>}
         {openMode === 'Trackpad' && <Trackpad />}
         {openMode === 'Voice' && <Voice handsFree={voiceHandsFree} onHandsFree={setVoiceHandsFree} />}
+        {openMode === 'Commands' && <Commands />}
         {openMode === 'Window' && <WindowSwitcher />}
         </div>
       </section>}

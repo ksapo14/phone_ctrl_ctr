@@ -1,6 +1,6 @@
 # Phone Control
 
-A minimal black-and-white iPhone remote for a Windows computer. The Node companion serves the React interface and sends authenticated WebSocket commands to one persistent Windows PowerShell helper. No cloud service or .NET SDK is needed.
+A minimal black-and-white iPhone remote for a Windows computer. The Node companion serves the React interface and sends authenticated WebSocket commands to one persistent Windows PowerShell helper. The optional Commands mode uses local FunctionGemma inference and Deepgram transcription.
 
 ## Start on the computer
 
@@ -11,7 +11,7 @@ npm install
 npm start
 ```
 
-After installing dependencies, you can also double-click **StartCompanion.cmd**. It builds the UI, starts the companion on port **8787**, and opens the computer pairing page. Keep the terminal running. Stop it with Ctrl+C. On subsequent runs, `npm run companion` skips the build. Launching again reopens the existing companion instead of starting a second server. If another application owns the port, choose another port with `PORT`.
+After installing dependencies, you can also double-click **StartCompanion.cmd**. It builds the UI, starts the companion on port **8787**, and opens the computer pairing page. When certificates from `scripts/setup-https.ps1` exist, this launcher uses HTTPS automatically. Keep the terminal running. Stop it with Ctrl+C. On subsequent runs, `npm run companion` skips the build. Launching again reopens the existing companion instead of starting a second server. If another application owns the port, choose another port with `PORT`.
 
 If Windows Firewall prompts, allow Node.js on **private networks**. The app does not change firewall rules. Connect the phone and PC to the same trusted Wi-Fi network; guest-network isolation and some VPNs can prevent a connection.
 
@@ -32,6 +32,7 @@ By default the service uses HTTP/WebSocket on a **trusted private LAN** without 
 - **Window:** swipe or drag between cards containing real open-window titles. Settling on a card activates that window. Dots and arrow keys also work. Window titles update periodically; these are title cards, not screen streaming or live thumbnails.
 - **Trackpad:** the blank area is the touch surface. The two bottom buttons support press/hold for left and right mouse buttons. You can hold left click with one finger while moving another finger on the surface.
 - **Voice:** hold the microphone for 250ms to hold mouse button 4 (XBUTTON1); releasing releases it. A short tap double-clicks button 4 for Wispr hands-free mode. Blue reflects the requested shortcut state. **Use phone mic** optionally streams your iPhone microphone to Wispr through VB-CABLE. This requires trusted HTTPS and a one-time Windows audio setup: see [Phone microphone setup](server/PHONE-MIC.md), then use `StartPhoneMicrophone.cmd`.
+- **Commands:** tap the microphone to record a short command, then tap again to send it, or type a command and press Run. The companion sends recorded audio to Deepgram, routes the transcript through the local FunctionGemma model, validates its tool calls, and runs the approved actions on the computer. This microphone needs HTTPS on the phone; typed commands work without it.
 - **Top left:** speaker volume. **Top right:** display brightness. Tap to expand the ticks, then drag inward to increase or outward to decrease. Values clamp to 0–100%. The 10px threshold avoids accidental changes. Wheel and arrow keys work too. Current computer values load on connection and refresh periodically.
 - **Bottom center:** a single play/pause media button sends the Windows media toggle key. The microphone gain and haptic corner sliders have been removed.
 - **X / Escape:** close the mode and return to the heading selector.
@@ -59,13 +60,27 @@ Brightness first uses the built-in display's WMI interface, then tries external 
 
 ## App detection and development
 
-For the standalone FunctionGemma voice-command dataset, H200 training script, Slurm launcher and evaluator, see [training/README.md](training/README.md). Voice-command model inference and speech recognition are not wired into the app yet.
+### Commands setup
 
-For a custom install location, copy `server/apps.example.json` to `server/apps.local.json` and edit the absolute executable paths. Only the six predefined app IDs can be overridden. The config is read locally at startup and cannot be edited from the phone.
+The model is loaded from `models/functiongemma-desktop-model`. Install its Python dependencies in an environment compatible with PyTorch and the model's Transformers version (5.17.0 or newer), then set `PHONE_PYTHON` to that environment's Python executable. For example:
+
+```powershell
+py -m venv .venv-commands
+.\.venv-commands\Scripts\python.exe -m pip install -r scripts\requirements.txt
+```
+
+Copy `.env.example` to `%USERPROFILE%\.phone-control\.env`, add `DEEPGRAM_API_KEY=your_key`, and optionally set `PHONE_PYTHON` to the absolute Python path if using another environment. This keeps secrets outside the OneDrive checkout. Explicit environment variables take priority; the project `.env` is supported as a fallback. The companion automatically uses `.venv-commands` when present. Restart it after changing the environment file. The key is sent only to Deepgram, never to the browser or child helpers. Deepgram is called only for recorded audio; typed commands go directly to the local model. Deepgram's [pre-recorded audio API](https://developers.deepgram.com/docs/pre-recorded-audio) is used with Nova-3.
+
+Supported model actions are start/focus Chrome, ChatGPT, Spotify, VS Code, Command Prompt, File Explorer, Notion and Settings; set volume and brightness; play/pause and skip media; and open Google Drive, GitHub, Google Docs and YouTube. Windows exposes a play/pause toggle key, so both model `play_media` and `pause_media` send that toggle. Notion must be installed or configured in `server/apps.local.json`. A missing Deepgram key affects speech only.
+
+At startup, the companion loads FunctionGemma and runs a warm-up inference in the background, then prints `FunctionGemma: ready.` The warm-up result is discarded without executing a desktop action. Commands submitted during warm-up wait for it to finish; subsequent commands use the same loaded model. If setup fails, the terminal reports the error and the rest of the controls remain available. The `--mock` preview skips model warm-up.
+
+For a custom install location, copy `server/apps.example.json` to `server/apps.local.json` and edit the absolute executable paths. Supported app IDs can be overridden. The config is read locally at startup and cannot be edited from the phone.
 
 ```powershell
 npm run build       # TypeScript + production bundle
 npm run lint        # Frontend checks
+npm run security:check # Redacted secret/file scan of source, index, branch history and build
 npm test            # Pairing/authentication/protocol + gesture tests
 node server/native-check.mjs # Windows capability check; writes current volume/brightness back unchanged
 node server/index.mjs --mock --no-open # Simulated computer for interface testing

@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { childEnvironment } from './environment.mjs';
 
 export class WindowsBridge {
   constructor() {
     this.pending = new Map(); this.serial = 0;
-    this.process = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(new URL('./bridge.ps1', import.meta.url))], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    this.process = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(new URL('./bridge.ps1', import.meta.url))], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: childEnvironment() });
     this.failure = null;
     createInterface({ input: this.process.stdout }).on('line', line => {
       try { const response = JSON.parse(line); const entry = this.pending.get(response.id);

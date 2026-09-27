@@ -1,0 +1,28 @@
+# Secrets and local credentials, at any level in the repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.cer
+*.crt
+*.csr
+*.srl
+*.key.path
+.npmrc
+.pypirc
+.netrc
+.aws/
+.ssh/
+credentials*.json
+service-account*.json
+id_rsa*
+id_ed25519*
+
+# These exact certificates are public, disposable loopback test fixtures.
+!phone_ctrl_ctr/server/fixtures/audio-test-cert.pem
+!phone_ctrl_ctr/server/fixtures/audio-test-key.pem

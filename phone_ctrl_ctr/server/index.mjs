@@ -11,6 +11,11 @@ import QRCode from 'qrcode';
 import { WindowsBridge, MockBridge } from './bridge.mjs';
 import { validateCommand } from './protocol.mjs';
 import { createAudioRelay } from './audio.mjs';
+import { FunctionGemmaRouter } from './command-router.mjs';
+import { transcribeDeepgram } from './deepgram.mjs';
+import { loadLocalEnvironment, childEnvironment } from './environment.mjs';
+
+loadLocalEnvironment();
 
 const secret = () => randomBytes(32).toString('hex');
 const equal = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -18,7 +23,7 @@ const loopback = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ad
 const cookie = (req, name) => (req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith(name + '='))?.slice(name.length + 1);
 const root = fileURLToPath(new URL('../dist', import.meta.url));
 
-export async function startServer({ port = Number(process.env.PORT || 8787), host = '0.0.0.0', bridge, openBrowser = true, launchBrowser, tls, audioSinkFactory } = {}) {
+export async function startServer({ port = Number(process.env.PORT || 8787), host = '0.0.0.0', bridge, openBrowser = true, launchBrowser, tls, audioSinkFactory, commandRouter = new FunctionGemmaRouter(), transcribe = transcribeDeepgram, warmModel = !(bridge instanceof MockBridge) } = {}) {
   if (!tls && (process.env.PHONE_TLS_CERT || process.env.PHONE_TLS_KEY)) {
     if (!process.env.PHONE_TLS_CERT || !process.env.PHONE_TLS_KEY) throw new Error('Set both PHONE_TLS_CERT and PHONE_TLS_KEY.');
     tls = { cert: await readFile(process.env.PHONE_TLS_CERT), key: await readFile(process.env.PHONE_TLS_KEY) };
@@ -28,6 +33,7 @@ export async function startServer({ port = Number(process.env.PORT || 8787), hos
   const adminKey = secret(); const adminSession = secret(); let pairing;
   let requests = 0; let lastOpen = 0; let controller = null; let state = null; let nativeError = null;
   const sessions = new Map(); const attempts = new Map(); const sockets = new Set();
+  const commandAttempts = new Map(); let commandBusy = false;
   const addresses = Object.values(networkInterfaces()).flat().filter(n => n && n.family === 'IPv4' && !n.internal).map(n => n.address);
   if (process.env.PHONE_HOST && /^[a-zA-Z0-9.:-]+$/.test(process.env.PHONE_HOST)) addresses.unshift(process.env.PHONE_HOST);
   const hosts = new Set(['localhost', '127.0.0.1', '[::1]', ...addresses]);
@@ -48,13 +54,19 @@ export async function startServer({ port = Number(process.env.PORT || 8787), hos
     return ++entry.count <= limit;
   }
   async function body(req) { let text = ''; for await (const chunk of req) { text += chunk; if (text.length > 4096) throw new Error('Request too large'); } return JSON.parse(text || '{}'); }
+  async function audioBody(req) {
+    const chunks = []; let size = 0;
+    for await (const chunk of req) { size += chunk.length; if (size > 5 * 1024 * 1024) throw new Error('Recording is too large. Keep commands under 15 seconds.'); chunks.push(chunk); }
+    if (size < 100) throw new Error('No microphone audio was recorded.');
+    return Buffer.concat(chunks);
+  }
   function json(res, status, data, cookies) { res.writeHead(status, { 'Content-Type': 'application/json', ...(cookies ? { 'Set-Cookie': cookies } : {}) }); res.end(JSON.stringify(data)); }
   function openHost(force = false) {
     if (!force && (!openBrowser || Date.now() - lastOpen < 60000)) return;
     lastOpen = Date.now();
     const url = `${scheme}://localhost:${actualPort}/host#admin=${adminKey}`;
     if (launchBrowser) { launchBrowser(url); return; }
-    const child = spawn('explorer.exe', [url], { windowsHide: true, stdio: 'ignore' }); child.on('error', () => {}); child.unref();
+    const child = spawn('explorer.exe', [url], { windowsHide: true, stdio: 'ignore', env: childEnvironment() }); child.on('error', () => {}); child.unref();
   }
   function broadcast(message) { const data = JSON.stringify(message); for (const ws of sockets) if (ws.readyState === 1) ws.send(data); }
   async function refresh() {
@@ -117,6 +129,37 @@ export async function startServer({ port = Number(process.env.PORT || 8787), hos
         const id = authenticated(req); sessions.delete(id); if (controller?.session === id) audio.stop(); for (const ws of sockets) if (ws.session === id) ws.close(4001, 'Unpaired');
         return json(res, 200, { ok: true }, 'pc_phone=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' + secureCookie);
       }
+      if ((path === '/api/commands/text' || path === '/api/commands/audio') && req.method === 'POST') {
+        const session = authenticated(req);
+        if (!session || controller?.session !== session || controller.readyState !== 1) return json(res, 401, { error: 'Connect the paired phone before sending commands.' });
+        const requestingController = controller;
+        const now = Date.now(); const attempt = commandAttempts.get(session) || { count: 0, until: now + 60000 };
+        if (now > attempt.until) { attempt.count = 0; attempt.until = now + 60000; }
+        commandAttempts.set(session, attempt);
+        if (++attempt.count > 12) return json(res, 429, { error: 'Too many commands. Wait a minute.' });
+        if (commandBusy) return json(res, 429, { error: 'A command is already being processed.' });
+        commandBusy = true;
+        try {
+          let text;
+          if (path.endsWith('/text')) text = (await body(req)).text;
+          else {
+            const type = req.headers['content-type']?.split(';')[0]?.toLowerCase();
+            if (!['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/wav'].includes(type)) throw new Error('Unsupported microphone recording format.');
+            text = await transcribe(await audioBody(req), type);
+          }
+          if (typeof text !== 'string' || !text.trim() || text.length > 240) throw new Error('Enter or speak a short command.');
+          text = text.trim();
+          const commands = await commandRouter.route(text);
+          if (!Array.isArray(commands) || !commands.length || commands.length > 4 || commands.some(command => !validateCommand(command))) throw new Error('The command model returned an unsupported action.');
+          for (const command of commands) {
+            if (authenticated(req) !== session || controller !== requestingController || controller.readyState !== 1) throw new Error('The phone disconnected before the command ran.');
+            await bridge.request(command);
+          }
+          await refresh();
+          return json(res, 200, { transcript: text, commands });
+        } catch (error) { return json(res, 400, { error: error.message || 'Command failed.' }); }
+        finally { commandBusy = false; }
+      }
       if (path.startsWith('/api/')) return json(res, 404, { error: 'Not found' });
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
       const filename = path === '/' || path === '/host' ? 'index.html' : decodeURIComponent(path).slice(1);
@@ -177,6 +220,13 @@ export async function startServer({ port = Number(process.env.PORT || 8787), hos
   try { bridge ??= new WindowsBridge(); }
   catch (error) { audio.close(); wss.close(); await new Promise(done => server.close(done)); throw error; }
   actualPort = server.address().port;
+  if (warmModel && commandRouter.warmup) {
+    console.log('FunctionGemma: loading and warming up…');
+    void Promise.resolve().then(() => commandRouter.warmup()).then(
+      () => console.log('FunctionGemma: ready.'),
+      error => console.error(`FunctionGemma warm-up failed: ${error.message}`),
+    );
+  }
   const heartbeat = setInterval(() => {
     for (const ws of sockets) { if (!ws.alive || (sessions.get(ws.session) || 0) < Date.now()) ws.terminate(); else { ws.alive = false; ws.ping(); } }
     for (const [key, value] of attempts) if (value.until < Date.now()) attempts.delete(key);
@@ -185,7 +235,7 @@ export async function startServer({ port = Number(process.env.PORT || 8787), hos
   let refreshing = false;
   const poll = setInterval(async () => { if (refreshing || !sockets.size) return; refreshing = true; try { await refresh(); } finally { refreshing = false; } }, 4000);
   void refresh(); openHost();
-  return { port: actualPort, scheme, adminKey, bridge, server, async close() { clearInterval(heartbeat); clearInterval(poll); audio.close(); for (const ws of sockets) ws.terminate(); wss.close(); await bridge.close(); await new Promise(resolveClose => server.close(resolveClose)); } };
+  return { port: actualPort, scheme, adminKey, bridge, server, async close() { clearInterval(heartbeat); clearInterval(poll); audio.close(); commandRouter.close?.(); for (const ws of sockets) ws.terminate(); wss.close(); await bridge.close(); await new Promise(resolveClose => server.close(resolveClose)); } };
 }
 
 export async function reuseCompanion(port, { openBrowser = true, scheme = process.env.PHONE_TLS_CERT ? 'https' : 'http' } = {}) {

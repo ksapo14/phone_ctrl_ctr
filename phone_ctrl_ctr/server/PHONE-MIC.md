@@ -17,33 +17,31 @@ The helper only opens a device matching `CABLE Input`; it never falls back to sp
 
 Safari requires a secure context for microphone access. A plain `http://192.168...` address cannot capture your phone microphone. Bypassing a certificate warning is not a substitute for a trusted certificate.
 
-For a private home setup, install [mkcert using its official instructions](https://github.com/FiloSottile/mkcert). Review and run these commands yourself: they create a local certificate authority and install its trust on the laptop.
+Run the project setup script in PowerShell from the project root. It uses OpenSSL to create a local certificate authority, then issues a server certificate for localhost and the current laptop LAN address. The CA and server private keys live in `%USERPROFILE%\.phone-control`, outside the OneDrive project. Only public certificates and the key's location are copied into the gitignored `certs` folder.
 
 Run PowerShell from the project root:
 
 ```powershell
-mkcert -install
-New-Item -ItemType Directory -Force certs | Out-Null
 # Replace with your laptop's Wi-Fi IPv4 address from the pairing page.
-$phoneControlIp = '192.168.1.50'
-mkcert -cert-file certs/server.pem -key-file certs/server-key.pem localhost 127.0.0.1 ::1 $phoneControlIp
-$phoneControlCa = (mkcert -CAROOT)
-Copy-Item -LiteralPath (Join-Path $phoneControlCa 'rootCA.pem') -Destination certs/rootCA.pem
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-https.ps1 -LanIp 192.168.1.50
+certutil -user -addstore Root certs/rootCA.pem
 ```
 
-Transfer **only `rootCA.pem`** to your own iPhone. Open it and install its profile in Settings, then enable full trust under **Settings → General → About → Certificate Trust Settings**. This trusts certificates issued by your local CA. Never transfer `rootCA-key.pem` or `server-key.pem`; private keys stay on the laptop. Remove the profile when you no longer need this CA.
+The launchers also call `TrustHttps.cmd` to install the CA for the Windows user running the launcher. If the desktop browser reports an untrusted certificate, run `TrustHttps.cmd` directly, accept the Windows certificate dialog if shown, and reload the page. This can repair trust without restarting the server.
 
-The `certs/` directory is gitignored and is not served by the app. Reserve your laptop's IP in the router, or regenerate the server certificate when its IP changes. A stable LAN hostname works with `PHONE_HOST` if it resolves on the phone and is included in the certificate.
+Transfer **only `certs/rootCA.cer`** to your own iPhone, for example through OneDrive. Open it and install its profile in Settings, then enable full trust under **Settings → General → About → Certificate Trust Settings**. This trusts certificates issued by your local CA. Never transfer the private keys in `%USERPROFILE%\.phone-control`. Remove the profile when you no longer need this CA.
+
+The `certs/` directory is gitignored and is not served by the app. Reserve your laptop's IP in the router, or rerun the script when its IP changes. The script reuses the same CA so the iPhone does not need to trust a new CA each time.
 
 ## 3. Start the HTTPS companion
 
-Stop the existing companion with Ctrl+C. Double-click **StartPhoneMicrophone.cmd** after the three certificate files exist. It rebuilds the app, starts HTTPS and opens the pairing page.
+Stop the existing companion with Ctrl+C. Double-click **StartCompanion.cmd** or **StartPhoneMicrophone.cmd** after the certificates exist. Both launch HTTPS and open the pairing page.
 
 Equivalent commands:
 
 ```powershell
 $env:PHONE_TLS_CERT = (Resolve-Path certs/server.pem).Path
-$env:PHONE_TLS_KEY = (Resolve-Path certs/server-key.pem).Path
+$env:PHONE_TLS_KEY = Join-Path $env:USERPROFILE '.phone-control\server-key.pem'
 $env:NODE_EXTRA_CA_CERTS = (Resolve-Path certs/rootCA.pem).Path
 npm start
 ```

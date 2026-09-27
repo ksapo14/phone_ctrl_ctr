@@ -7,16 +7,19 @@ $candidates = @{
   chrome = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe")
   vscode = @("$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe", "$env:ProgramFiles\Microsoft VS Code\Code.exe")
   spotify = @("$env:APPDATA\Spotify\Spotify.exe")
+  notion = @("$env:LOCALAPPDATA\Programs\Notion\Notion.exe", "$env:LOCALAPPDATA\Notion\Notion.exe")
   chatgpt = @()
+  settings = @()
   explorer = @("$env:WINDIR\explorer.exe")
   cmd = @("$env:WINDIR\System32\cmd.exe")
 }
 foreach ($name in $candidates.Keys) {
   foreach ($candidate in $candidates[$name]) { if (Test-Path -LiteralPath $candidate) { $appMap[$name] = @{path=$candidate}; break } }
 }
+$appMap['settings'] = @{uri='ms-settings:'}
 try {
   $startApps = @(Get-StartApps)
-  foreach ($entry in @(@{key='chatgpt';pattern='^ChatGPT$'}, @{key='spotify';pattern='^Spotify'}, @{key='chrome';pattern='^Google Chrome$'}, @{key='vscode';pattern='^Visual Studio Code$'})) {
+  foreach ($entry in @(@{key='chatgpt';pattern='^ChatGPT$'}, @{key='spotify';pattern='^Spotify'}, @{key='chrome';pattern='^Google Chrome$'}, @{key='vscode';pattern='^Visual Studio Code$'}, @{key='notion';pattern='^Notion$'})) {
     if (!$appMap.ContainsKey($entry.key)) {
       $match = $startApps | Where-Object { $_.Name -match $entry.pattern -and $_.AppID -like '*!*' } | Select-Object -First 1
       if ($match) { $appMap[$entry.key] = @{appId=$match.AppID} }
@@ -58,7 +61,13 @@ while ($null -ne ($line = [Console]::ReadLine())) {
       'launch' {
         $app = $appMap[[string]$command.app]
         if (!$app) { throw 'This app is not installed or was not found. Set its path in server/apps.local.json.' }
-        if ($app.path) { Start-Process -FilePath $app.path | Out-Null } else { Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList "shell:AppsFolder\$($app.appId)" | Out-Null }
+        if ($app.path) { Start-Process -FilePath $app.path | Out-Null } elseif ($app.uri) { Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList $app.uri | Out-Null } else { Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList "shell:AppsFolder\$($app.appId)" | Out-Null }
+      }
+      'website' {
+        $urls = @{google_drive='https://drive.google.com/';github='https://github.com/';google_docs='https://docs.google.com/';youtube='https://www.youtube.com/'}
+        $url = $urls[[string]$command.site]
+        if (!$url) { throw 'Unsupported website' }
+        Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList $url | Out-Null
       }
       'move' { [WindowsControl]::Move([int]$command.dx,[int]$command.dy) }
       'scroll' { [WindowsControl]::Scroll([int]$command.dx,[int]$command.dy) }

@@ -1,13 +1,14 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { childEnvironment } from './environment.mjs';
 
 export class WindowsAudioSink {
   constructor() {
     this.closed = false;
     this.child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
       fileURLToPath(new URL('./audio.ps1', import.meta.url)), '-DeviceName', process.env.PHONE_AUDIO_DEVICE || 'CABLE Input'],
-    { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: childEnvironment() });
     this.ready = new Promise((resolve, reject) => {
       let output = '', errors = '';
       const fail = error => { clearTimeout(timer); reject(error); this.onError?.(error); };

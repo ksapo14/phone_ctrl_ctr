@@ -1,4 +1,5 @@
-const apps = new Set(['chrome', 'vscode', 'chatgpt', 'spotify', 'explorer', 'cmd']);
+const apps = new Set(['chrome', 'vscode', 'chatgpt', 'spotify', 'explorer', 'cmd', 'notion', 'settings']);
+const sites = new Set(['google_drive', 'github', 'google_docs', 'youtube']);
 const gestures = new Set(['taskView', 'desktop', 'nextWindow', 'previousWindow', 'nextDesktop', 'previousDesktop', 'search', 'notifications']);
 const number = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
 export function validateCommand(c) {
@@ -6,6 +7,7 @@ export function validateCommand(c) {
   switch (c.type) {
     case 'state': case 'windows': case 'release': return true;
     case 'launch': return apps.has(c.app);
+    case 'website': return sites.has(c.site);
     case 'media': return ['playPause', 'next', 'previous', 'stop'].includes(c.action);
     case 'move': return number(c.dx, -500, 500) && number(c.dy, -500, 500);
     case 'scroll': return number(c.dx, -1200, 1200) && number(c.dy, -1200, 1200);

@@ -6,6 +6,7 @@ import { startServer, reuseCompanion } from './index.mjs';
 import { MockBridge } from './bridge.mjs';
 import { validateCommand } from './protocol.mjs';
 import { readFileSync } from 'node:fs';
+import { parseToolCalls } from './command-router.mjs';
 
 test('pairing, authenticated controls, invalid commands, takeover and revocation', async t => {
   const bridge = new MockBridge();
@@ -62,11 +63,9 @@ test('strict input bounds reject unsafe or unsupported input', () => {
   assert.equal(validateCommand({ type: 'media', action: 'arbitrary' }), false);
 });
 
-test('every generated training output maps to an accepted companion command', () => {
-  for (const split of ['train', 'validation', 'test']) {
-    const rows = readFileSync(new URL(`../training/data/${split}.jsonl`, import.meta.url), 'utf8').trim().split('\n').map(JSON.parse);
-    for (const row of rows) if (row.expected_command !== null) assert.equal(validateCommand(row.expected_command), true, row.utterance);
-  }
+test('bundled model smoke outputs map to accepted companion commands', () => {
+  const rows = JSON.parse(readFileSync(new URL('./fixtures/functiongemma-smoke-outputs.json', import.meta.url), 'utf8'));
+  for (const row of rows) for (const command of parseToolCalls(row.output)) assert.equal(validateCommand(command), true, row.prompt);
 });
 
 test('relaunch reuses the companion and cannot expose its admin key to browser requests', async t => {
