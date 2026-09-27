@@ -1652,9 +1652,9 @@ HELD_OUT = [
     ),
 
     (
-        "Put Chat GPT on screen",
-        [tool_call("start_app", app="chatgpt")],
-        "app",
+    "I want the ChatGPT desktop client in front of me",
+    [tool_call("start_app", app="chatgpt")],
+    "app",
     ),
 
     (
